@@ -1,6 +1,3 @@
-const https = require("https");
-const zlib = require("zlib");
-const querystring = require("querystring");
 const { spawn } = require("child_process");
 const prompts = require("prompts");
 const fs = require("fs");
@@ -34,32 +31,6 @@ const loadConfig = () => {
   return config;
 };
 
-const decompressResponse = (res) => {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    res.on("data", (chunk) => chunks.push(chunk));
-    res.on("error", reject);
-    res.on("end", () => {
-      const buffer = Buffer.concat(chunks);
-      const encoding = res.headers["content-encoding"];
-      const callback = (err, d) =>
-        err ? reject(err) : resolve(d.toString("utf-8"));
-      if (encoding === "br") zlib.brotliDecompress(buffer, callback);
-      else if (encoding === "gzip") zlib.gunzip(buffer, callback);
-      else callback(null, buffer);
-    });
-  });
-};
-
-const request = (options, postData = null) => {
-  return new Promise((resolve, reject) => {
-    const req = https.request(options, resolve);
-    req.on("error", reject);
-    if (postData) req.write(postData);
-    req.end();
-  });
-};
-
 const apiRequest = async ({
   path,
   method = "GET",
@@ -68,11 +39,9 @@ const apiRequest = async ({
   port = 443,
   refererPath = "/",
 }) => {
+  const url = `https://${BASE_HOSTNAME}:${port}${path}`;
   const options = {
-    hostname: BASE_HOSTNAME,
-    path,
     method,
-    port,
     headers: {
       "User-Agent": USER_AGENT,
       "X-Requested-With": "XMLHttpRequest",
@@ -83,86 +52,75 @@ const apiRequest = async ({
   };
 
   if (postData) {
-    const data = querystring.stringify(postData);
+    options.body = new URLSearchParams(postData);
     options.headers["Content-Type"] =
       "application/x-www-form-urlencoded; charset=UTF-8";
-    options.headers["Content-Length"] = Buffer.byteLength(data);
-    const res = await request(options, data);
-    return decompressResponse(res);
-  } else {
-    const res = await request(options);
-    return decompressResponse(res);
   }
+
+  const response = await fetch(url, options);
+
+  if (!response.ok) {
+    throw new Error(`Błąd sieciowy: Otrzymano status ${response.status}`);
+  }
+
+  return response;
 };
 
-const performLogin = (login, password) => {
-  return new Promise((resolve, reject) => {
-    https.get(`https://${BASE_HOSTNAME}`, (res) => {
-      const phpSessId = res.headers["set-cookie"]?.find((c) =>
-        c.startsWith("PHPSESSID="),
-      );
-      if (!phpSessId)
-        return reject(new Error("Nie udało się uzyskać PHPSESSID."));
+const performLogin = async (login, password) => {
+  const initialResponse = await fetch(`https://${BASE_HOSTNAME}/`);
+  if (!initialResponse.ok) {
+    throw new Error(
+      "Nie udało się nawiązać połączenia w celu uzyskania sesji.",
+    );
+  }
+  const initialCookieHeader = initialResponse.headers.get("set-cookie");
+  const phpSessId = initialCookieHeader?.split(";")[0];
 
-      const postData = querystring.stringify({ login, pass: password });
-      const options = {
-        hostname: BASE_HOSTNAME,
-        path: "/manager.php?action=login",
-        method: "POST",
-        headers: {
-          Cookie: phpSessId,
-          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-          "Content-Length": Buffer.byteLength(postData),
-          "User-Agent": USER_AGENT,
-          "X-Requested-With": "XMLHttpRequest",
-          Origin: `https://${BASE_HOSTNAME}`,
-          Referer: `https://${BASE_HOSTNAME}/`,
-        },
-      };
+  if (!phpSessId) {
+    throw new Error("Nie udało się uzyskać PHPSESSID.");
+  }
 
-      const req = https.request(options, (loginRes) => {
-        let body = "";
-        loginRes.on("data", (chunk) => (body += chunk));
-        loginRes.on("end", () => {
-          try {
-            if (JSON.parse(body).data !== "OK")
-              return reject(new Error("Umiesz wpisywać poprawnie swoje dane?"));
-            const authCookies = loginRes.headers["set-cookie"];
-            const userId = authCookies.find((c) => c.startsWith("user_id="));
-            const userKey = authCookies.find((c) => c.startsWith("user_key="));
-            if (!userId || !userKey)
-              return reject(
-                new Error("Nie udało się uzyskać ciasteczek autoryzacyjnych."),
-              );
-            const finalCookies = [phpSessId, userId, userKey]
-              .map((c) => c.split(";")[0])
-              .join("; ");
-            resolve(finalCookies);
-          } catch (e) {
-            reject(
-              new Error(
-                "[error] Błąd przetwarzania odpowiedzi serwera po logowaniu.",
-              ),
-            );
-          }
-        });
-      });
-      req.on("error", (e) =>
-        reject(new Error(`[error] Błąd zapytania logowania: ${e.message}`)),
-      );
-      req.write(postData);
-      req.end();
-    });
+  const loginResponse = await apiRequest({
+    path: "/manager.php?action=login",
+    method: "POST",
+    cookies: phpSessId,
+    postData: { login, pass: password },
+    refererPath: "/",
   });
+
+  const loginData = await loginResponse.json();
+  if (loginData.data !== "OK") {
+    throw new Error("Umiesz wpisywać poprawnie swoje dane?");
+  }
+
+  const loginCookieHeader = loginResponse.headers.get("set-cookie");
+  if (!loginCookieHeader) {
+    throw new Error("Nie udało się uzyskać ciasteczek autoryzacyjnych.");
+  }
+
+  const authCookies = loginCookieHeader.split(", ");
+  const userId = authCookies.find((c) => c.startsWith("user_id="));
+  const userKey = authCookies.find((c) => c.startsWith("user_key="));
+
+  if (!userId || !userKey) {
+    throw new Error("Nie udało się uzyskać ciasteczek autoryzacyjnych.");
+  }
+
+  const finalCookies = [
+    phpSessId,
+    userId.split(";")[0],
+    userKey.split(";")[0],
+  ].join("; ");
+  return finalCookies;
 };
 
 const getAnimeNameSuggestions = async (cookies) => {
   try {
-    const jsonString = await apiRequest({
+    const response = await apiRequest({
       path: "/manager.php?action=get_anime_names",
       cookies,
     });
-    const data = JSON.parse(jsonString);
+    const data = await response.json();
     if (Array.isArray(data.json)) {
       return data.json;
     }
@@ -177,19 +135,21 @@ const getAnimeNameSuggestions = async (cookies) => {
 
 const searchAnime = async (cookies, query) => {
   const postData = { page: 1, search_type: "name", search: query };
-  const jsonString = await apiRequest({
+  const response = await apiRequest({
     path: "/manager.php?action=get_search",
     method: "POST",
     cookies,
     postData,
   });
-  const htmlContent = JSON.parse(jsonString).data;
+  const data = await response.json();
+  const htmlContent = data.data;
   const matches = [...htmlContent.matchAll(/\/anime\/([a-zA-Z0-9_-]+)/g)];
   return [...new Set(matches.map((m) => m[1]))];
 };
 
 const getEpisodes = async (cookies, animeSlug) => {
-  const html = await apiRequest({ path: `/anime/${animeSlug}`, cookies });
+  const response = await apiRequest({ path: `/anime/${animeSlug}`, cookies });
+  const html = await response.text();
   const regex =
     /<li.*?class="[^"]*list-group-item[^"]*".*?title="(.*?)".*?ep_id="(\d+)".*?>/gs;
   const matches = [...html.matchAll(regex)];
@@ -209,13 +169,13 @@ const getEpisodes = async (cookies, animeSlug) => {
 };
 
 const fetchEpisodeLinks = async (cookies, episodeId, animeSlug) => {
-  const jsonString = await apiRequest({
+  const response = await apiRequest({
     path: `/Player/${episodeId}`,
     port: 8443,
     cookies,
     refererPath: `/anime/${animeSlug}`,
   });
-  const data = JSON.parse(jsonString);
+  const data = await response.json();
   if (!Array.isArray(data))
     throw new Error(
       "[error] Jprdl, to miała być tablica linków, a serwer odesłał jakieś gówno.",
@@ -413,11 +373,10 @@ async function main() {
   };
 
   try {
-    // przywitanie
     console.clear();
     console.log(
       figlet.textSync("OgladajAnime", { font: "4Max" }),
-      "scrapper by k0aziu (v1.0)",
+      "scrapper by k0aziu (v1.1)",
     );
     console.log("");
     console.log(
