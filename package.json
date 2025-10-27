@@ -1,0 +1,14 @@
+{
+  "name": "ogladajanime-scrapper",
+  "version": "1.0.0",
+  "main": "index.js",
+  "author": "k0aziu",
+  "license": "MIT",
+  "dependencies": {
+    "figlet": "^1.9.3",
+    "https": "^1.0.0",
+    "prompts": "^2.4.2",
+    "querystring": "^0.2.1",
+    "zlib": "^1.0.5"
+  }
+}
